@@ -105,20 +105,20 @@ Input File (EDF / CSV / XLSX / Image)
 
 ### Why an Ensemble Over a Single Model
 
-A single model on EEG data is prone to overfitting to noise or dataset-specific patterns. The ensemble uses **soft-vote probability averaging** — all five models produce a probability vector and these are averaged before taking the final class. This consistently outperforms any individual model on ambiguous or borderline signals and prevents the "always Normal" bias that single models exhibit when training data has low class separability.
+A single model on EEG data is prone to overfitting to noise or dataset-specific patterns. The ensemble uses **soft-vote probability averaging**, all five models produce a probability vector and these are averaged before taking the final class. This consistently outperforms any individual model on ambiguous or borderline signals and prevents the "always Normal" bias that single models exhibit when training data has low class separability.
 
 ### Why Not Deep Learning (CNN/LSTM)
 
 - EEG feature datasets (tabular, 46 columns) do not provide the spatial/temporal raw signal structure that CNNs/LSTMs require to outperform tree ensembles
 - Deep learning requires far more labelled data and GPU resources
 - Tree ensembles on well-engineered EEG features match or beat deep learning on datasets of this size while being fully explainable and deterministic
-- This project prioritises clinical explainability — every prediction comes with a feature importance breakdown that a clinician can audit
+- This project prioritises clinical explainability, every prediction comes with a feature importance breakdown that a clinician can audit
 
 ---
 
 ## 💡 Key Innovation — Synthetic Training Engine
 
-A core discovery during development was that the real training dataset (`epilepsy_data.csv`, 289k rows) had **near-zero class separability** — ANOVA showed p > 0.05 for most features, and a Random Forest trained purely on the real data achieved ~26% accuracy, identical to random chance for 4 classes.
+A core discovery during development was that the real training dataset (`epilepsy_data.csv`, 289k rows) had **near-zero class separability** , ANOVA showed p > 0.05 for most features, and a Random Forest trained purely on the real data achieved ~26% accuracy, identical to random chance for 4 classes.
 
 **Solution:** A physics-based synthetic training engine (`generate_synthetic_training_data` in `dataset.py`) generates EEG feature vectors using **clinically accurate Gaussian profiles** derived from published neurophysiology literature for each seizure type:
 
@@ -225,7 +225,7 @@ Then open your browser to: **http://localhost:8501**
 ### Option A — Train on Synthetic Data (no dataset file needed, recommended for quick start)
 
 1. Open the **🏥 Dashboard** tab
-2. Click **"🧪 Train on Synthetic Data Only"** — this generates 32,000 clinically accurate training samples (8,000 per class) and takes about 60 seconds
+2. Click **"🧪 Train on Synthetic Data Only"** , this generates 32,000 clinically accurate training samples (8,000 per class) and takes about 60 seconds
 3. Click **"🤖 Train AI Models"**
 4. Go to the **📁 Upload & Analyse** tab
 5. Drop any EEG file (EDF, CSV, XLSX, or image)
@@ -237,13 +237,13 @@ Then open your browser to: **http://localhost:8501**
 1. Open the **🏥 Dashboard** tab
 2. Enter the full path to `epilepsy_data.csv` in the text box
 3. Set the max rows (50k is fast; 200k is more accurate)
-4. Click **"📂 Load Dataset"** — the system automatically augments with synthetic data
+4. Click **"📂 Load Dataset"** , the system automatically augments with synthetic data
 5. Click **"🤖 Train AI Models"**
 6. The trained model is saved as `neuroscan_trained.pkl` and auto-loads on next startup
 
 ### Option C — Load a pre-trained model
 
-If `neuroscan_trained.pkl` exists in the project folder, it loads automatically on startup — no retraining needed. You can go straight to uploading files.
+If `neuroscan_trained.pkl` exists in the project folder, it loads automatically on startup, no retraining needed. You can go straight to uploading files.
 
 ---
 
