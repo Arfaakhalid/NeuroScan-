@@ -3,6 +3,9 @@
 
 
 NeuroScan Pro is a advanced system that classifies epileptic seizure types from EEG data using a clinical-grade machine learning pipeline. It accepts raw EEG recordings, pre-extracted feature files, or scanned EEG report images and produces a deterministic diagnosis with confidence scores, clinical reasoning, ICD-10 codes, and interactive visualisations.
+
+---
+
 [![Watch the Demo](https://img.youtube.com/vi/U8y2IY2Ayzs/0.jpg)](https://youtu.be/U8y2IY2Ayzs)
 
 ---
