@@ -529,7 +529,7 @@ def _header():
     st.markdown("""
     <div class="med-header">
         <h1>🧬 NEUROSCAN PRO</h1>
-        <p>Clinical-Grade Epilepsy Detection &amp; EEG Analysis System</p>
+        <p>Clinical-Grade Epilepsy Detection &amp; EEG Analysis System by ARK</p>
         <div style="margin-top:1rem;display:flex;justify-content:center;gap:2rem;">
             <span class="pill pill-ok">⚡ AI Medical Help </span>
             <span class="pill pill-info">🧠 4 Seizure Types</span>
