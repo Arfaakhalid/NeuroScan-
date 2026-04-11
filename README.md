@@ -5,6 +5,7 @@
 NeuroScan Pro is a advanced system that classifies epileptic seizure types from EEG data using a clinical-grade machine learning pipeline. It accepts raw EEG recordings, pre-extracted feature files, or scanned EEG report images and produces a deterministic diagnosis with confidence scores, clinical reasoning, ICD-10 codes, and interactive visualisations.
 
 ---
+### Video Demo
 
 [![Watch the Demo](https://img.youtube.com/vi/U8y2IY2Ayzs/0.jpg)](https://youtu.be/U8y2IY2Ayzs)
 
@@ -118,7 +119,7 @@ A single model on EEG data is prone to overfitting to noise or dataset-specific 
 
 ## 💡 Key Innovation — Synthetic Training Engine
 
-A core discovery during development was that the real training dataset (`epilepsy_data.csv`, 289k rows) had **near-zero class separability** , ANOVA showed p > 0.05 for most features, and a Random Forest trained purely on the real data achieved ~26% accuracy, identical to random chance for 4 classes.
+A core discovery during development was that the real training dataset (`epilepsy_data.csv`, 289k rows) had **near-zero class separability** , ANOVA showed p > 0.05 for most features, and a Random Forest trained purely on the real data.
 
 **Solution:** A physics-based synthetic training engine (`generate_synthetic_training_data` in `dataset.py`) generates EEG feature vectors using **clinically accurate Gaussian profiles** derived from published neurophysiology literature for each seizure type:
 
