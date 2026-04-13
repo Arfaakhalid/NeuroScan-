@@ -11,7 +11,7 @@ NeuroScan Pro is a advanced system that classifies epileptic seizure types from 
 
 ---
 
-## 📋 Table of Contents
+## Table of Contents
 
 - [What It Does](#-what-it-does)
 - [Seizure Types Detected](#-seizure-types-detected)
@@ -29,7 +29,7 @@ NeuroScan Pro is a advanced system that classifies epileptic seizure types from 
 
 ---
 
-## 🔬 What It Does
+## What It Does
 
 NeuroScan Pro takes an EEG input file, extracts 46 clinical EEG features across time-domain, frequency-domain, wavelet, nonlinear entropy, and fractal dimension domains, and classifies the signal into one of four seizure categories. The result includes:
 
@@ -55,7 +55,7 @@ NeuroScan Pro takes an EEG input file, extracts 46 clinical EEG features across 
 
 ---
 
-## 🏗 System Architecture
+## System Architecture
 
 ```
 Input File (EDF / CSV / XLSX / Image)
@@ -92,7 +92,7 @@ Input File (EDF / CSV / XLSX / Image)
 
 ---
 
-## 🤖 Models & Why This Approach
+## Models & Why This Approach
 
 ### Model Selection
 
@@ -117,7 +117,7 @@ A single model on EEG data is prone to overfitting to noise or dataset-specific 
 
 ---
 
-## 💡 Key Innovation — Synthetic Training Engine
+##  Key Innovation — Synthetic Training Engine
 
 A core discovery during development was that the real training dataset (`epilepsy_data.csv`, 289k rows) had **near-zero class separability** , ANOVA showed p > 0.05 for most features, and a Random Forest trained purely on the real data.
 
@@ -211,7 +211,7 @@ python -c "import streamlit, sklearn, xgboost, lightgbm, mne, pywt; print('All d
 
 ---
 
-## ▶️ How to Run
+## How to Run
 
 ```bash
 streamlit run app.py
@@ -221,7 +221,7 @@ Then open your browser to: **http://localhost:8501**
 
 ---
 
-## 🖥 Usage Walkthrough
+##  Usage Walkthrough
 
 ### Option A — Train on Synthetic Data (no dataset file needed, recommended for quick start)
 
@@ -248,7 +248,7 @@ If `neuroscan_trained.pkl` exists in the project folder, it loads automatically 
 
 ---
 
-## ✨ Features at a Glance
+##  Features at a Glance
 
 - **4-class epilepsy classification** — Normal, Focal, Absence, Tonic-Atonic
 - **Deterministic predictions** — same file always produces the same result (fixed seeds + feature-name alignment)
@@ -263,7 +263,7 @@ If `neuroscan_trained.pkl` exists in the project folder, it loads automatically 
 
 ---
 
-## 📊 Dataset
+##  Dataset
 
 The system was developed and tested using the real patients dataset, temple university dataset &  **Epilepsy EEG Dataset** (`epilepsy_data.csv`) containing 289,010 records with 50 pre-extracted EEG features per record across 4 class labels:
 
