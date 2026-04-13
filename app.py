@@ -432,6 +432,23 @@ def _load_eeg_file(uploaded_file):
                     eeg_viz = preprocess(arr.T, fs)
             except Exception:
                 pass
+            # -- Validate CSV is EEG-related
+            try:
+                import io as _io_v
+                _dfv = pd.read_csv(
+                    _io_v.StringIO(data.decode("utf-8", errors="replace")),
+                    sep=None, engine="python", nrows=5)
+                _csv_ok, _csv_why = _validate_tabular(_dfv, name)
+                if not _csv_ok:
+                    st.error("❌ Not an EEG file — " + _csv_why)
+                    st.info(
+                        "Please upload an EEG feature CSV "
+                        "(same column format as epilepsy_data.csv) or "
+                        "a raw EEG time-series CSV (rows=time, columns=channels)."
+                    )
+                    return None, None, None, None, fs
+            except Exception:
+                pass  # validation read failed; allow through
             return feat_vec, feat_names, true_label, eeg_viz, fs
 
         # ── XLSX / XLS ─────────────────────────────────────────
@@ -467,6 +484,15 @@ def _load_eeg_file(uploaded_file):
                 else:
                     feat_names = raw_names
 
+                # -- Validate XLSX is EEG-related
+                _xl_ok, _xl_why = _validate_tabular(df_xl, name)
+                if not _xl_ok:
+                    st.error("❌ Not an EEG file — " + _xl_why)
+                    st.info(
+                        "Please upload an EEG feature XLSX "
+                        "(same column format as epilepsy_data.csv)."
+                    )
+                    return None, None, None, None, fs
                 return feat_vec, feat_names, true_label, eeg_viz, fs
             except Exception as e:
                 st.error(f"Error reading Excel file: {e}")
@@ -474,12 +500,183 @@ def _load_eeg_file(uploaded_file):
 
         # ── Image ──────────────────────────────────────────────
         if name.endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".gif")):
+            _img_ok, _img_why = _validate_image(data)
+            if not _img_ok:
+                st.error("❌ Not an EEG image — " + _img_why)
+                st.info(
+                    "**Accepted image types:**\n"
+                    "- Scanned EEG paper printouts (black signal traces on white paper)\n"
+                    "- EEG software or digital recorder screenshots\n"
+                    "- Clinical EEG report images or plots\n\n"
+                    "**Not accepted:** photographs, posters, advertisements, logos, "
+                    "diagrams, or any image unrelated to EEG brain signals."
+                )
+                return None, None, None, None, fs
             return _load_image_eeg(data, fs, train_feat_names)
 
     except Exception as e:
         st.error(f"Error loading file: {e}")
     return None, None, None, None, fs
 
+
+
+# =====================================================================
+#  FILE VALIDATORS  --  reject non-EEG uploads before any processing
+# =====================================================================
+
+_EEG_COL_KW = {
+    "delta","theta","alpha","beta","gamma","eeg","seizure","amplitude",
+    "entropy","kurtosis","hjorth","wavelet","spectral","frequency","band",
+    "correlation","lyapunov","hurst","fractal","spike","power","energy",
+    "zero_crossing","zcr","rms","variance","mobility","complexity",
+    "line_length","sample","approximate","shannon","permutation",
+    "detrended","higuchi","katz","lempel","interictal","mean_eeg",
+    "signal_energy","peak_to_peak","psd","cross_corr","auto_corr",
+}
+
+_NON_EEG_COL_KW = {
+    "name","surname","firstname","lastname","address","phone","email",
+    "price","cost","revenue","sales","profit","invoice","order","product",
+    "description","category","city","country","month","year",
+    "employee","department","salary","company","brand","item",
+    "quantity","stock","rating","review","comment","title","subject",
+    "customer","client","vendor","tax","discount","total","amount",
+}
+
+
+def _validate_image(data):
+    # Returns (is_valid: bool, reason: str).
+    # Accepts EEG paper printouts, EEG software screenshots, clinical EEG
+    # report images.  Rejects photos, posters, adverts, logos, diagrams.
+    try:
+        from PIL import Image as _PIL
+        import io as _io
+        import numpy as _np
+        img  = _PIL.open(_io.BytesIO(data))
+        W, H = img.size
+
+        # 1 -- Minimum size
+        if W < 200 or H < 80:
+            return False, (
+                f"Image too small ({W}x{H} px). "
+                "EEG recordings are at least 200x80 px."
+            )
+
+        # 2 -- Orientation: EEG traces are landscape or square, never portrait
+        if H > W * 1.5:
+            return False, (
+                f"Image is strongly portrait-oriented ({W}x{H} px). "
+                "EEG recordings are always landscape or square. "
+                "This looks like a photo or poster, not an EEG report."
+            )
+
+        # 3 -- Colour / brightness profile
+        gray = img.convert("L")
+        g    = _np.array(gray, dtype=_np.float32)
+        white_frac  = float((g > 200).mean())   # light paper background
+        dark_frac   = float((g < 55).mean())    # signal lines / text
+        mid_frac    = 1.0 - white_frac - dark_frac
+        overall_std = float(g.std())
+        rgb    = _np.array(img.convert("RGB"), dtype=_np.float32)
+        ch_std = float(_np.std(rgb, axis=2).mean())  # per-pixel colour variance
+
+        # Accumulate evidence that image is NOT an EEG recording
+        score = 0
+        if white_frac < 0.18: score += 2   # no white paper background
+        if dark_frac  > 0.50: score += 1   # too much solid black
+        if mid_frac   > 0.62: score += 2   # heavy mid-tones = photo/illustration
+        if ch_std     > 32:   score += 2   # high colour variance = poster/photo
+        if overall_std > 88:  score += 1   # high luminance range = natural photo
+
+        if score >= 4:
+            return False, (
+                "This image does not look like an EEG recording or report. "
+                "It appears to be a photograph, poster, or illustration "
+                f"(colour_var={ch_std:.0f}, white_bg={white_frac*100:.0f}%, "
+                f"mid_tones={mid_frac*100:.0f}%). "
+                "Please upload an EEG signal image, EEG software screenshot, "
+                "or a scanned EEG report."
+            )
+
+        # 4 -- Must have actual signal variation (not blank/solid-colour)
+        if overall_std < 8:
+            return False, (
+                "Image appears to be blank or solid-colour. "
+                "Please upload an actual EEG recording or report image."
+            )
+
+        return True, ""
+
+    except Exception as _ex:
+        return False, f"Could not read image: {_ex}"
+
+
+def _validate_tabular(df, filename):
+    # Returns (is_valid: bool, reason: str).
+    # Accepts EEG feature CSVs/XLSXs and raw EEG time-series.
+    # Rejects sales/HR/contact spreadsheets and unrelated data tables.
+    if df is None or len(df) == 0:
+        return False, f"'{filename}' is empty."
+
+    drop_set = {
+        "multi_class_label","seizure_type_label","label","class","target",
+        "age","gender","medication_status","seizure_history",
+    }
+    num_df = df.drop(
+        columns=[c for c in df.columns if c.lower() in drop_set],
+        errors="ignore"
+    ).select_dtypes(include=["number"])
+
+    n_num   = num_df.shape[1]
+    cols_lc = [c.lower().strip() for c in df.columns]
+
+    # 1 -- Need at least 5 numeric columns
+    if n_num < 5:
+        return False, (
+            f"Only {n_num} numeric column(s) found. "
+            "An EEG feature file needs at least 5 numeric columns. "
+            "This does not look like EEG data."
+        )
+
+    # 2 -- Obvious non-EEG column names -> reject
+    bad_cols = [c for c in cols_lc if c in _NON_EEG_COL_KW]
+    if len(bad_cols) >= 3:
+        return False, (
+            f"Column names suggest a non-EEG spreadsheet: {bad_cols[:5]}. "
+            "This looks like sales, HR, or contact data. "
+            "Please upload an EEG feature CSV or XLSX."
+        )
+
+    # 3 -- Recognised EEG column names -> accept immediately
+    eeg_hits = [c for c in cols_lc if any(kw in c for kw in _EEG_COL_KW)]
+    if eeg_hits:
+        return True, ""
+
+    # 4 -- Generic numeric column names (f0, f1, ch0, ch1...)
+    generic = sum(1 for c in cols_lc if len(c) > 1 and c[0] in ("f","c") and c[1:].isdigit())
+    if generic >= 5:
+        return True, ""
+
+    # 5 -- All-integer column names (0, 1, 2...)
+    try:
+        all_int = all(c.lstrip("-").isdigit() for c in cols_lc)
+    except Exception:
+        all_int = False
+    if all_int and n_num >= 10:
+        return True, ""
+
+    # 6 -- Large numeric file (>= 20 cols) = probably raw time-series
+    if n_num >= 20:
+        return True, ""
+
+    # 7 -- 5-19 numeric cols, no EEG keywords -> reject
+    return False, (
+        f"Could not confirm this is an EEG file. "
+        f"Found {n_num} numeric columns but no EEG feature names. "
+        f"Columns: {list(df.columns[:6])}... "
+        "Please upload an EEG feature file (epilepsy_data.csv column format) "
+        "or a raw EEG time-series with >= 20 numeric columns."
+    )
 
 def _load_image_eeg(data: bytes, fs: float, train_feat_names):
     """
@@ -534,7 +731,7 @@ def _header():
             <span class="pill pill-ok">⚡ AI Medical Help </span>
             <span class="pill pill-info">🧠 4 Seizure Types</span>
             <span class="pill pill-warn">📋 Explainable AI</span>
-            <span class="pill pill-ok">🔒 Deterministic Results</span>
+            <span class="pill pill-ok">🔒 Deterministic Results</span><br>
         </div>
     </div>
     """, unsafe_allow_html=True)
