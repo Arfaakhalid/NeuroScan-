@@ -2,7 +2,7 @@
 ### Clinical-Grade Epilepsy Detection & EEG Analysis System
 
 
-NeuroScan Pro is a advanced system that classifies epileptic seizure types from EEG data using a clinical-grade machine learning pipeline. It accepts raw EEG recordings, pre-extracted feature files, or scanned EEG report images and produces a deterministic diagnosis with confidence scores, clinical reasoning, ICD-10 codes, and interactive visualisations.
+NeuroScan Pro is a advanced system that classifies epileptic seizure types from EEG data using a clinical-grade machine learning pipeline with interactive chatbot. It accepts raw EEG recordings, pre-extracted feature files, or scanned EEG report images and produces a deterministic diagnosis with confidence scores, clinical reasoning, ICD-10 codes, and interactive visualisations.
 
 ---
 ### Video Demo
@@ -41,6 +41,7 @@ NeuroScan Pro takes an EEG input file, extracts 46 clinical EEG features across 
 - Radar chart comparing the sample against all four clinical prototypes
 - Scalp topography (brain map) for raw EEG files
 - Spike detection rate and dominant frequency analysis
+- Realtime interactive chat with Neuro chatbot
 
 ---
 
@@ -77,9 +78,9 @@ Input File (EDF / CSV / XLSX / Image)
         ▼
   StandardScaler  →  Ensemble Classifier (models.py)
                       ├─ Random Forest
-                      ├─ Extra Trees
-                      ├─ XGBoost
-                      ├─ LightGBM
+                      ├─ CNN
+                      ├─ SVM
+                      ├─ KNN
                       └─ Logistic Regression
                               │
                               ▼
@@ -99,21 +100,14 @@ Input File (EDF / CSV / XLSX / Image)
 | Model | Role | Why Chosen |
 |-------|------|------------|
 | **Random Forest** | Primary classifier | Handles non-linear EEG feature interactions; robust to noise; gives feature importance |
-| **Extra Trees** | Diversity in ensemble | Faster than RF with more randomisation; reduces variance when combined |
-| **XGBoost** | Gradient boosting | Handles class imbalance well via boosting; strong on tabular EEG features |
-| **LightGBM** | Fast gradient boosting | Leaf-wise growth finds subtle seizure patterns; very fast training |
+| **KNN** | Diversity in ensemble | Faster than RF with more randomisation; reduces variance when combined |
+| **CNN-10** | Gradient boosting | Handles class imbalance well via boosting; strong on tabular EEG features |
+| **SVM** | Fast gradient boosting | Leaf-wise growth finds subtle seizure patterns; very fast training |
 | **Logistic Regression** | Calibrated baseline | Provides well-calibrated probability scores to anchor the ensemble |
 
 ### Why an Ensemble Over a Single Model
 
 A single model on EEG data is prone to overfitting to noise or dataset-specific patterns. The ensemble uses **soft-vote probability averaging**, all five models produce a probability vector and these are averaged before taking the final class. This consistently outperforms any individual model on ambiguous or borderline signals and prevents the "always Normal" bias that single models exhibit when training data has low class separability.
-
-### Why Not Deep Learning (CNN/LSTM)
-
-- EEG feature datasets (tabular, 46 columns) do not provide the spatial/temporal raw signal structure that CNNs/LSTMs require to outperform tree ensembles
-- Deep learning requires far more labelled data and GPU resources
-- Tree ensembles on well-engineered EEG features match or beat deep learning on datasets of this size while being fully explainable and deterministic
-- This project prioritises clinical explainability, every prediction comes with a feature importance breakdown that a clinician can audit
 
 ---
 
@@ -128,7 +122,7 @@ A core discovery during development was that the real training dataset (`epileps
 - **Absence:** Very high delta (2.60), very high kurtosis (28.0), very low entropy (0.08), high cross-correlation (0.42), low ZCR (18.0)
 - **Tonic-Atonic:** Highest ZCR (145.0), highest amplitude (1.15), highest wavelet energy (42.0), high Hjorth complexity (2.80)
 
-This synthetic data achieves **100% F1 score** on held-out validation. The real CSV data is used as noise-augmentation on top of this synthetic base, and a **clinical rule-based engine** runs in parallel to override the ML model when EEG signatures are unambiguous.
+This synthetic data achieves **90%+ F1 score** on held-out validation. The real CSV data is used as noise-augmentation on top of this synthetic base, and a **clinical rule-based engine** runs in parallel to override the ML model when EEG signatures are unambiguous.
 
 ---
 
@@ -232,6 +226,7 @@ Then open your browser to: **http://localhost:8501**
 5. Drop any EEG file (EDF, CSV, XLSX, or image)
 6. Click **"🔬 Run Full Epilepsy Analysis"**
 7. View results in the **🔍 Result** tab
+8. Real-time interactive chat with **💬 Ask NeuroBot**
 
 ### Option B — Train on your own dataset (epilepsy_data.csv)
 
@@ -259,7 +254,7 @@ If `neuroscan_trained.pkl` exists in the project folder, it loads automatically 
 - **Radar chart** — sample vs all four clinical prototypes for instant visual comparison
 - **Scalp topography** — brain map for raw EEG files (EDF/BDF)
 - **Multi-format support** — EDF, BDF, CSV, XLSX, PNG, JPG
-- **No GPU required** — runs entirely on CPU
+- **Chatbot** — interactive chatting with NeuroBot
 
 ---
 
@@ -274,7 +269,7 @@ The system was developed and tested using the real patients dataset, temple univ
 | 2 | Absence | 57,905 |
 | 3 | Tonic-Atonic | 28,934 |
 
-The dataset can be provided on demand(shanerumman4@gmail.com). Place it anywhere on your machine and provide the full path in the Dashboard.
+The dataset can be provided on demand (shanerumman4@gmail.com). Place it anywhere on your machine and provide the full path in the Dashboard.
 
 For raw EEG testing, the **CHB-MIT Scalp EEG Database** (PhysioNet) `.edf` files are fully supported.
 
