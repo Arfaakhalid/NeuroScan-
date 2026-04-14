@@ -117,6 +117,7 @@ _DEFAULTS = dict(
     prediction=None, prediction_hash=None,
     eeg_raw=None, eeg_fs=256.0, eeg_filename="",
     feature_names=[], n_train_samples=0, n_classes=N_CLASSES,
+    chat_history=[],
 )
 for k, v in _DEFAULTS.items():
     if k not in st.session_state:
@@ -273,6 +274,56 @@ def _plot_feat_importance(explanation: dict):
                       margin=dict(l=10,r=10,t=60,b=40))
     return fig
 
+
+
+def _plot_confusion_matrix(cm_data: list, model_name: str):
+    """Heatmap confusion matrix."""
+    labels = [SEIZURE_TYPES[i] for i in range(N_CLASSES)]
+    cm     = np.array(cm_data)
+    # Normalise to percentages
+    row_sums = cm.sum(axis=1, keepdims=True).clip(1)
+    cm_pct   = (cm / row_sums * 100).round(1)
+
+    text_vals = [[f"{cm_pct[r,c]:.1f}%\n({cm[r,c]})"
+                  for c in range(N_CLASSES)] for r in range(N_CLASSES)]
+
+    fig = go.Figure(go.Heatmap(
+        z=cm_pct, x=labels, y=labels,
+        text=text_vals, texttemplate="%{text}",
+        colorscale="Blues", showscale=True,
+        hoverongaps=False,
+    ))
+    fig.update_layout(
+        title=f"Confusion Matrix — {model_name} (val set, % + count)",
+        xaxis_title="Predicted", yaxis_title="Actual",
+        **_DARK, height=380, margin=dict(l=10,r=10,t=60,b=60)
+    )
+    fig.update_xaxes(**_AXIS)
+    fig.update_yaxes(autorange="reversed", **_AXIS)
+    return fig
+
+
+def _plot_cv_results(cv_results: dict):
+    """Bar chart of K-fold CV mean F1 with std error bars."""
+    names  = [n for n in cv_results if "cv_f1_mean" in cv_results[n]]
+    if not names:
+        return None
+    means  = [cv_results[n]["cv_f1_mean"] for n in names]
+    stds   = [cv_results[n]["cv_f1_std"]  for n in names]
+    fig = go.Figure(go.Bar(
+        x=names, y=means,
+        error_y=dict(type="data", array=stds, visible=True, color="#ff9800"),
+        marker_color="#00bcd4",
+        text=[f"{m:.3f}±{s:.3f}" for m,s in zip(means,stds)],
+        textposition="outside",
+    ))
+    fig.update_layout(
+        title="5-Fold Cross-Validation F1 (mean ± std)",
+        **_DARK, margin=dict(l=50,r=20,t=60,b=60)
+    )
+    fig.update_xaxes(**_AXIS)
+    fig.update_yaxes(range=[0, 1.05], title_text="Weighted F1", **_AXIS)
+    return fig
 
 def _plot_clinical_thresholds(feat_vec: np.ndarray, feat_names: list):
     """
@@ -545,70 +596,166 @@ _NON_EEG_COL_KW = {
 
 
 def _validate_image(data):
-    # Returns (is_valid: bool, reason: str).
-    # Accepts EEG paper printouts, EEG software screenshots, clinical EEG
-    # report images.  Rejects photos, posters, adverts, logos, diagrams.
+    # ─────────────────────────────────────────────────────────────────
+    # STRICT EEG image validator.
+    # An EEG image must pass ALL hard gates.  We default to REJECT
+    # and only accept when MULTIPLE independent EEG signals are present.
+    #
+    # Hard rejection triggers (ANY one → reject immediately):
+    #   • Too small
+    #   • Portrait orientation  (photos / posters / selfies)
+    #   • High colour saturation (photographs / posters / coloured diagrams)
+    #   • Skin-tone dominant pixels (face photos)
+    #   • Too few light-background pixels (dark-themed non-EEG images)
+    #   • Mid-tone-dominant content (natural photos)
+    #   • Too many dark pixels overall (x-ray / MRI / dark images)
+    #   • Single-colour / blank image
+    #   • Insufficient horizontal-stripe structure (EEG channels run left→right)
+    #   • No visible thin oscillating traces (column-wise variance test)
+    # ─────────────────────────────────────────────────────────────────
     try:
         from PIL import Image as _PIL
         import io as _io
         import numpy as _np
-        img  = _PIL.open(_io.BytesIO(data))
+
+        img = _PIL.open(_io.BytesIO(data))
         W, H = img.size
 
-        # 1 -- Minimum size
+        # ── Hard gate 1: minimum size ────────────────────────────────
         if W < 200 or H < 80:
             return False, (
-                f"Image too small ({W}x{H} px). "
-                "EEG recordings are at least 200x80 px."
+                f"Image too small ({W}×{H} px). "
+                "EEG recordings are at least 200×80 px."
             )
 
-        # 2 -- Orientation: EEG traces are landscape or square, never portrait
-        if H > W * 1.5:
+        # ── Hard gate 2: portrait orientation ────────────────────────
+        # EEG records are ALWAYS landscape or square.
+        # Anything taller than wide (even by a little) → reject.
+        if H > W * 1.05:
             return False, (
-                f"Image is strongly portrait-oriented ({W}x{H} px). "
+                f"Portrait orientation ({W}×{H} px). "
                 "EEG recordings are always landscape or square. "
-                "This looks like a photo or poster, not an EEG report."
+                "This looks like a photo, selfie, or poster — not an EEG."
             )
 
-        # 3 -- Colour / brightness profile
-        gray = img.convert("L")
-        g    = _np.array(gray, dtype=_np.float32)
-        white_frac  = float((g > 200).mean())   # light paper background
-        dark_frac   = float((g < 55).mean())    # signal lines / text
-        mid_frac    = 1.0 - white_frac - dark_frac
-        overall_std = float(g.std())
-        rgb    = _np.array(img.convert("RGB"), dtype=_np.float32)
-        ch_std = float(_np.std(rgb, axis=2).mean())  # per-pixel colour variance
+        # ── Pixel analysis ────────────────────────────────────────────
+        rgb_arr = _np.array(img.convert("RGB"), dtype=_np.float32)   # H×W×3
+        gray    = _np.array(img.convert("L"),   dtype=_np.float32)   # H×W
 
-        # Accumulate evidence that image is NOT an EEG recording
-        score = 0
-        if white_frac < 0.18: score += 2   # no white paper background
-        if dark_frac  > 0.50: score += 1   # too much solid black
-        if mid_frac   > 0.62: score += 2   # heavy mid-tones = photo/illustration
-        if ch_std     > 32:   score += 2   # high colour variance = poster/photo
-        if overall_std > 88:  score += 1   # high luminance range = natural photo
+        r_ch, g_ch, b_ch = rgb_arr[:,:,0], rgb_arr[:,:,1], rgb_arr[:,:,2]
 
-        if score >= 4:
+        # Per-pixel colour saturation
+        sat_per_px = float(_np.mean(_np.std(rgb_arr, axis=2)))
+
+        # ── Hard gate 3: high colour saturation ──────────────────────
+        # EEG images (paper / screen caps): sat ≈ 0–18
+        # Colour photos / posters: sat ≈ 30–80+
+        if sat_per_px > 22:
             return False, (
-                "This image does not look like an EEG recording or report. "
-                "It appears to be a photograph, poster, or illustration "
-                f"(colour_var={ch_std:.0f}, white_bg={white_frac*100:.0f}%, "
-                f"mid_tones={mid_frac*100:.0f}%). "
-                "Please upload an EEG signal image, EEG software screenshot, "
-                "or a scanned EEG report."
+                f"High colour saturation ({sat_per_px:.1f}). "
+                "EEG recordings are monochrome or near-monochrome. "
+                "Colour photographs, posters, illustrations, and face images "
+                "are not EEG data."
             )
 
-        # 4 -- Must have actual signal variation (not blank/solid-colour)
-        if overall_std < 8:
+        # ── Hard gate 4: skin-tone detection ─────────────────────────
+        # Skin tones: R>95, G>40, B>20, R>G, R>B, |R-G|>15, R-B>15
+        skin_mask = (
+            (r_ch > 95) & (g_ch > 40) & (b_ch > 20) &
+            (r_ch > g_ch) & (r_ch > b_ch) &
+            (_np.abs(r_ch - g_ch) > 15) & ((r_ch - b_ch) > 15)
+        )
+        skin_frac = float(skin_mask.mean())
+        if skin_frac > 0.08:
             return False, (
-                "Image appears to be blank or solid-colour. "
-                "Please upload an actual EEG recording or report image."
+                f"Skin-tone pixels detected ({skin_frac*100:.0f}% of image). "
+                "This appears to be a photograph of a person, face, or body. "
+                "Please upload an EEG signal recording or report image."
             )
 
+        # ── Compute pixel distribution ────────────────────────────────
+        white_frac  = float((gray > 220).mean())   # bright white
+        light_frac  = float((gray > 160).mean())   # light (incl. cream)
+        dark_frac   = float((gray < 50).mean())    # very dark
+        mid_frac    = 1.0 - light_frac - dark_frac
+        overall_std = float(gray.std())
+
+        # ── Hard gate 5: insufficient light background ────────────────
+        # EEG paper: > 50% light pixels
+        if light_frac < 0.45:
+            return False, (
+                f"Insufficient light background ({light_frac*100:.0f}% light px). "
+                "EEG paper recordings have > 45% light/white background. "
+                "Dark images, MRI scans, X-rays, or photos are not accepted."
+            )
+
+        # ── Hard gate 6: mid-tone dominated (natural photos) ──────────
+        if mid_frac > 0.50:
+            return False, (
+                f"Mid-tone dominated ({mid_frac*100:.0f}% mid-tone px). "
+                "EEG images are high-contrast (white bg + thin dark traces). "
+                "This looks like a natural photograph or illustration."
+            )
+
+        # ── Hard gate 7: too many dark pixels ─────────────────────────
+        if dark_frac > 0.40:
+            return False, (
+                f"Too many dark pixels ({dark_frac*100:.0f}%). "
+                "EEG traces are thin lines on a light background — "
+                "a mostly dark image is not an EEG printout."
+            )
+
+        # ── Hard gate 8: blank / near-uniform image ────────────────────
+        if overall_std < 12:
+            return False, "Image appears blank or nearly uniform — not an EEG recording."
+
+        # ── Hard gate 9: horizontal trace structure ────────────────────
+        # EEG channels run left→right. Column-wise variance (oscillation
+        # within each column) should be reasonable; row-wise variance
+        # (contrast between channel rows) should also be present.
+        col_var = float(_np.mean(_np.var(gray, axis=0)))   # variance along x
+        row_var = float(_np.mean(_np.var(gray, axis=1)))   # variance along y
+
+        # Reject if column variance is almost zero (no oscillating traces)
+        if col_var < 8:
+            return False, (
+                "No horizontal signal traces detected (column variance too low). "
+                "EEG recordings contain multiple oscillating channel traces. "
+                "This image does not match that pattern."
+            )
+
+        # Reject if the image is essentially purely vertical (portrait structure)
+        if row_var > 0 and (col_var / (row_var + 1e-6)) < 0.25:
+            return False, (
+                "Image has predominantly vertical structure. "
+                "EEG recordings have horizontal channel traces. "
+                "This does not appear to be an EEG recording."
+            )
+
+        # ── Hard gate 10: must have multiple horizontal stripes ────────
+        # Divide image into N_STRIPES horizontal bands; each EEG channel
+        # strip should have meaningful variance (i.e., contain a signal).
+        N_STRIPES = 4
+        strip_h   = max(1, H // N_STRIPES)
+        active_stripes = 0
+        for s in range(N_STRIPES):
+            strip = gray[s*strip_h:(s+1)*strip_h, :]
+            if strip.std() > 6 and strip.mean() > 100:
+                active_stripes += 1
+        if active_stripes < 2:
+            return False, (
+                f"Only {active_stripes} of {N_STRIPES} horizontal strips "
+                "contain signal-like content. "
+                "An EEG image should show multiple channel traces stacked vertically. "
+                "This image does not have that structure."
+            )
+
+        # ── Final accept: all hard gates passed ───────────────────────
         return True, ""
 
     except Exception as _ex:
         return False, f"Could not read image: {_ex}"
+
 
 
 def _validate_tabular(df, filename):
@@ -794,14 +941,14 @@ def _tab_dashboard():
             help="Rows per class. 50k = fast, 200k = accurate."
         )
 
-    load_btn = st.button("📂 Load Dataset", use_container_width=True)
+    load_btn = st.button("📂 Load Dataset", key="btn_load_dataset", use_container_width=True)
     if load_btn:
         _load_dataset(csv_path, max_rows=int(max_rows_k) * 1000)
 
     # ── Step 1b: Train on synthetic only ─────────────────────
     st.markdown("**— or —**")
     if st.button("🧪 Train on Synthetic Data",
-                 use_container_width=True,
+                 key="btn_train_synthetic", use_container_width=True,
                  help="Generates clinically accurate synthetic EEG feature data. "
                       " "):
         _load_synthetic_only()
@@ -817,11 +964,11 @@ def _tab_dashboard():
     st.markdown("#### Step 2 — Train AI models")
     col_t1, col_t2 = st.columns(2)
     with col_t1:
-        train_btn = st.button("🤖 Train AI Models", use_container_width=True,
+        train_btn = st.button("🤖 Train AI Models", key="btn_train_models", use_container_width=True,
                               disabled=not st.session_state.data_loaded)
     with col_t2:
         if os.path.exists(MODEL_SAVE_PATH):
-            load_saved = st.button("📦 Load Saved Model", use_container_width=True)
+            load_saved = st.button("📦 Load Saved Model", key="btn_load_saved", use_container_width=True)
             if load_saved:
                 _load_saved_model()
 
@@ -829,18 +976,14 @@ def _tab_dashboard():
         _train_models()
 
     if st.session_state.models_trained and st.session_state.classifier:
-        metrics = st.session_state.classifier.metrics
-        st.markdown('<div class="card"><h3>📈 Model Performance</h3>',
-                    unsafe_allow_html=True)
-        st.plotly_chart(_plot_metrics_table(metrics), use_container_width=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+        st.success("✅ Models are trained and ready. See the **🤖 Models** tab for full performance metrics.")
 
 
 def _load_synthetic_only():
     with st.spinner("Generating synthetic training data with clinical EEG profiles ..."):
         X, y, feat_names = generate_synthetic_training_data(
-            n_per_class=8000, noise_scale=0.12, seed=42)
-        split = prepare_split(X, y, test_size=0.2, val_size=0.1, scale=True)
+            n_per_class=10000, noise_scale=0.10, seed=42)
+        split = prepare_split(X, y, test_size=0.15, val_size=0.15, scale=True)
         st.session_state.split           = split
         st.session_state.feature_names   = feat_names
         st.session_state.n_train_samples = len(X)
@@ -858,7 +1001,7 @@ def _load_dataset(csv_path: str, max_rows: int = 50_000):
         try:
             X, y, feat_names = load_real_csv(
                 csv_path, max_rows=max_rows, use_synthetic_augment=True)
-            split = prepare_split(X, y, test_size=0.2, val_size=0.1, scale=True)
+            split = prepare_split(X, y, test_size=0.15, val_size=0.15, scale=True)
             st.session_state.split           = split
             st.session_state.feature_names   = feat_names
             st.session_state.n_train_samples = len(X)
@@ -876,17 +1019,20 @@ def _train_models():
 
     progress = st.progress(0)
     status   = st.empty()
+    total_models = 5   # RF, LR, SVM, KNN, CNN-1D
 
     def _cb(idx, total, name):
-        progress.progress((idx + 1) / total)
+        progress.progress((idx + 1) / max(total, 1))
         status.text(f"Training {name} ({idx+1}/{total}) ...")
 
-    with st.spinner("Training models on clinical EEG profiles ..."):
+    with st.spinner("Training 5 models (RandomForest, LogisticRegression, SVM, KNN, CNN-1D) ..."):
         metrics = clf.train(
             split["X_train"], split["y_train"],
             split["X_val"],   split["y_val"],
+            X_test=split.get("X_test"), y_test=split.get("y_test"),
             feature_names=st.session_state.feature_names,
             progress_cb=_cb,
+            run_cv=True, n_cv_splits=5,
         )
 
     clf.scaler = split["scaler"]
@@ -903,8 +1049,17 @@ def _train_models():
     valid = {n: v for n, v in metrics.items() if "error" not in v}
     if valid:
         best_f1 = max(v["f1"] for v in valid.values())
-        st.success(f"✅ Training complete!  Best: **{clf.best_model_name}**  "
-                   f"(F1 = {best_f1:.4f})")
+        st.success(
+            f"✅ Training complete — 70% train / 15% val / 15% test\n"
+            f"Best model: **{clf.best_model_name}**  (Val F1 = {best_f1:.4f})"
+        )
+        # Show split sizes
+        s = split
+        st.info(
+            f"Train: {len(s['X_train']):,} | "
+            f"Val: {len(s['X_val']):,} | "
+            f"Test: {len(s.get('X_test', [])):,} samples"
+        )
     else:
         st.error("All models failed. Check your dataset.")
 
@@ -1007,7 +1162,7 @@ def _tab_upload():
             st.warning("⚠️ Train models first (Dashboard → Train AI Models or Synthetic).")
         else:
             if st.button("🔬 Run Full Epilepsy Analysis",
-                         use_container_width=True, type="primary"):
+                         key="btn_run_analysis", use_container_width=True, type="primary"):
                 _run_analysis(feat_vec, feat_names, file_hash, eeg_viz, fs)
 
 
@@ -1072,7 +1227,7 @@ def _tab_predict():
         st.subheader("🧪 Demo — analyse a synthetic sample")
         demo_type = st.selectbox("Select seizure type to simulate",
                                  [SEIZURE_TYPES[i] for i in range(N_CLASSES)])
-        if st.button("▶️ Run Demo Analysis"):
+        if st.button("▶️ Run Demo Analysis", key="btn_demo"):
             if not st.session_state.models_trained:
                 st.warning("Train models first.")
             else:
@@ -1367,45 +1522,692 @@ def _tab_models():
         st.info("Train models first (Dashboard → Train AI Models).")
         return
 
-    clf = st.session_state.classifier
+    clf   = st.session_state.classifier
+    split = st.session_state.split or {}
+
+    # ── Split info banner ──────────────────────────────────────
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Train", f"{len(split.get('X_train',[])): ,}" if split.get('X_train') is not None else "—")
+    c2.metric("Val (15%)",  f"{len(split.get('X_val',[])): ,}"   if split.get('X_val') is not None else "—")
+    c3.metric("Test (15%)", f"{len(split.get('X_test',[])): ,}"  if split.get('X_test') is not None else "—")
+    c4.metric("Best Model", clf.best_model_name or "—")
+
+    st.markdown("---")
+
+    # ── Validation metrics table ───────────────────────────────
+    st.markdown("#### 📊 Validation Set Metrics")
     st.plotly_chart(_plot_metrics_table(clf.metrics), use_container_width=True)
-    st.markdown(f"**Best model:** {clf.best_model_name}  "
-                f"(F1 = {clf.metrics.get(clf.best_model_name,{}).get('f1',0):.4f})")
 
+    # ── Test set metrics table ─────────────────────────────────
+    if clf._test_metrics:
+        st.markdown("#### 🧪 Held-out Test Set Metrics (15%)")
+        rows = []
+        for name, v in clf._test_metrics.items():
+            if "error" not in v:
+                rows.append((name, v.get("test_accuracy",0), v.get("test_precision",0),
+                             v.get("test_recall",0), v.get("test_f1",0)))
+        rows.sort(key=lambda r: r[4], reverse=True)
+        fig_t = go.Figure(go.Table(
+            header=dict(
+                values=["<b>Model</b>","<b>Test Acc</b>","<b>Test Prec</b>",
+                        "<b>Test Recall</b>","<b>Test F1</b>"],
+                fill_color="#0d47a1", font=dict(color="white",size=13), align="left"),
+            cells=dict(
+                values=[[r[0] for r in rows],
+                        [f"{r[1]:.4f}" for r in rows],[f"{r[2]:.4f}" for r in rows],
+                        [f"{r[3]:.4f}" for r in rows],[f"{r[4]:.4f}" for r in rows]],
+                fill_color=[["#1a1f2e","#161b22"]*20],
+                font=dict(color="#e0e0e0",size=12), align="left"),
+        ))
+        fig_t.update_layout(margin=dict(l=0,r=0,t=0,b=0), paper_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig_t, use_container_width=True)
+
+    st.markdown("---")
+
+    # ── Val + Test F1 comparison chart ─────────────────────────
+    st.markdown("#### 📈 Val vs Test F1 — Overfitting Check")
     valid = {n: v for n, v in clf.metrics.items() if "error" not in v}
-    names = list(valid.keys())
-    fig = go.Figure()
-    fig.add_trace(go.Bar(name="F1 (weighted)", x=names,
-                         y=[valid[n]["f1"] for n in names], marker_color="#00bcd4"))
-    fig.add_trace(go.Bar(name="Accuracy", x=names,
-                         y=[valid[n]["accuracy"] for n in names], marker_color="#42a5f5"))
-    fig.update_layout(barmode="group", title="Model Comparison",
-                      **_DARK, margin=dict(l=50,r=20,t=60,b=40))
-    fig.update_xaxes(**_AXIS)
-    fig.update_yaxes(range=[0, 1], **_AXIS)
-    st.plotly_chart(fig, use_container_width=True)
+    names_m = sorted(valid.keys())
+    val_f1s  = [valid[n]["f1"] for n in names_m]
+    test_f1s = [clf._test_metrics.get(n,{}).get("test_f1", 0) for n in names_m]
+    fig_cmp = go.Figure()
+    fig_cmp.add_trace(go.Bar(name="Val F1",  x=names_m, y=val_f1s,
+                             marker_color="#00bcd4"))
+    fig_cmp.add_trace(go.Bar(name="Test F1", x=names_m, y=test_f1s,
+                             marker_color="#ff9800"))
+    fig_cmp.update_layout(barmode="group",
+                          title="Validation F1 vs Test F1 (close gap = no overfitting)",
+                          **_DARK, margin=dict(l=50,r=20,t=60,b=60))
+    fig_cmp.update_xaxes(**_AXIS)
+    fig_cmp.update_yaxes(range=[0,1.05], title_text="Weighted F1", **_AXIS)
+    st.plotly_chart(fig_cmp, use_container_width=True)
 
-    # Feature importance from best model
+    # ── K-fold CV results ──────────────────────────────────────
+    if clf.cv_results:
+        st.markdown("#### 🔄 5-Fold Cross-Validation Results")
+        cv_fig = _plot_cv_results(clf.cv_results)
+        if cv_fig:
+            st.plotly_chart(cv_fig, use_container_width=True)
+        with st.expander("CV details table"):
+            cv_rows = [(n, v["cv_f1_mean"], v["cv_f1_std"],
+                        v["cv_acc_mean"], v["cv_acc_std"])
+                       for n, v in clf.cv_results.items()]
+            cv_df = pd.DataFrame(cv_rows,
+                columns=["Model","CV F1 mean","CV F1 std","CV Acc mean","CV Acc std"])
+            st.dataframe(cv_df, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # ── Confusion matrix for best model ───────────────────────
+    st.markdown(f"#### 🗂️ Confusion Matrix — {clf.best_model_name}")
+    best_cm = clf.metrics.get(clf.best_model_name, {}).get("confusion_matrix")
+    if best_cm:
+        col_cm1, col_cm2 = st.columns(2)
+        with col_cm1:
+            st.markdown("**Validation set**")
+            st.plotly_chart(_plot_confusion_matrix(best_cm, clf.best_model_name),
+                            use_container_width=True)
+        with col_cm2:
+            test_cm = clf._test_metrics.get(clf.best_model_name, {}).get("test_cm")
+            if test_cm:
+                st.markdown("**Test set (held-out 15%)**")
+                st.plotly_chart(_plot_confusion_matrix(test_cm,
+                                f"{clf.best_model_name} [TEST]"),
+                                use_container_width=True)
+
+    # ── Per-model confusion matrix selector ───────────────────
+    with st.expander("🗂️ Confusion matrix for any model"):
+        all_names = [n for n,v in clf.metrics.items()
+                     if "confusion_matrix" in v and "error" not in v]
+        if all_names:
+            sel = st.selectbox("Select model", all_names)
+            sel_cm = clf.metrics[sel]["confusion_matrix"]
+            st.plotly_chart(_plot_confusion_matrix(sel_cm, sel),
+                            use_container_width=True)
+
+    # ── Feature importance ─────────────────────────────────────
     clf_obj = clf.trained.get(clf.best_model_name)
     if clf_obj and hasattr(clf_obj, "feature_importances_"):
-        fi = clf_obj.feature_importances_
+        fi         = clf_obj.feature_importances_
         names_feat = clf.feature_names
-        top = np.argsort(fi)[::-1][:20]
+        top        = np.argsort(fi)[::-1][:20]
         fig2 = go.Figure(go.Bar(
             x=[fi[i] for i in top],
             y=[names_feat[i] if i < len(names_feat) else f"f{i}" for i in top],
             orientation="h", marker_color="#00bcd4",
         ))
         fig2.update_layout(title=f"Top 20 Features — {clf.best_model_name}",
-                           height=500, **_DARK,
-                           margin=dict(l=10,r=10,t=60,b=40))
+                           height=520, **_DARK, margin=dict(l=10,r=10,t=60,b=40))
         fig2.update_xaxes(title_text="Feature Importance", **_AXIS)
         fig2.update_yaxes(autorange="reversed", **_AXIS)
         st.plotly_chart(fig2, use_container_width=True)
 
 
-# ── Tab: Settings ─────────────────────────────────────────────
-def _tab_settings():
+# ── Tab: NeuroBot Chatbot ─────────────────────────────────────
+def _neurobot_answer(question: str, prediction: dict) -> str:
+    """
+    Rule-based intelligent chatbot that answers EEG / epilepsy questions.
+    Prioritises context from the current prediction result when available.
+    Returns a markdown-formatted answer string.
+    """
+    q = question.lower().strip()
+    # Remove punctuation noise
+    import re as _re
+    q = _re.sub(r"[^\w\s]", " ", q)
+    q = " ".join(q.split())
+
+    # ── Helpers ──────────────────────────────────────────────────────
+    stype   = prediction.get("seizure_type",  "Unknown")  if prediction else None
+    conf    = prediction.get("confidence",    0.0)        if prediction else None
+    icd10   = prediction.get("icd10",         "--")       if prediction else None
+    is_epi  = prediction.get("is_epileptic",  False)      if prediction else False
+    bp      = prediction.get("band_power",    {})         if prediction else {}
+    si      = prediction.get("spike_info",    {})         if prediction else {}
+    domf    = prediction.get("dom_freq",      0)          if prediction else 0
+    desc    = prediction.get("description",   "")         if prediction else ""
+
+    has_result = prediction is not None and stype not in (None, "Unknown")
+
+    def _result_ctx():
+        if not has_result:
+            return ""
+        return (f"\n\n📋 **Your latest result:** {stype} "
+                f"(confidence {conf*100:.0f}%, ICD-10: {icd10})")
+
+    # ── Intent matching helpers ────────────────────────────────────
+    def _has(*words):
+        return any(w in q for w in words)
+
+    def _has_all(*words):
+        return all(w in q for w in words)
+
+    # ────────────────────────────────────────────────────────────────
+    # INTENT 1: greeting / what can you do
+    # ────────────────────────────────────────────────────────────────
+    if _has("hello", "hi", "hey", "greet") or q in ("what can you do", "help", "who are you"):
+        return (
+            "👋 **Hi! I'm NeuroBot**, the AI assistant for NeuroScan Pro.\n\n"
+            "I can answer questions about:\n"
+            "- Your **EEG analysis result** and what it means\n"
+            "- **Seizure types** — Normal, Focal, Absence, Tonic-Atonic\n"
+            "- **EEG features** — band power, entropy, spikes, Hjorth parameters\n"
+            "- **What to do next** after a result\n"
+            "- **Medications**, general management, and clinical context\n\n"
+            "Just ask me anything! For example:\n"
+            "*\"What does my result mean?\"*, *\"What is an absence seizure?\"*, "
+            "*\"What causes focal seizures?\"*"
+        )
+
+    # ────────────────────────────────────────────────────────────────
+    # INTENT 2: what does my result / diagnosis mean
+    # ────────────────────────────────────────────────────────────────
+    if (_has("result", "diagnosis", "diagnos", "mean", "tell me", "explain my", "what does") and
+            _has("result", "diagnos", "prediction", "detection", "finding", "output", "say")):
+        if not has_result:
+            return ("⚠️ No result yet — please upload an EEG file and run analysis first. "
+                    "Then I can explain exactly what the result means.")
+        if not is_epi:
+            return (
+                f"✅ **Your EEG shows: Normal**\n\n"
+                f"The AI detected **no epileptic activity** in your EEG. "
+                f"Brain electrical signals appear to be within normal clinical parameters:\n"
+                f"- Alpha rhythm (8–13 Hz) is dominant — typical of a healthy awake brain\n"
+                f"- No spike-wave discharges or epileptiform patterns were found\n"
+                f"- Spectral entropy is high, reflecting complex, irregular (healthy) brain activity\n\n"
+                f"**Confidence:** {conf*100:.0f}%\n\n"
+                f"⚠️ This is AI-assisted screening. A normal result does **not** rule out "
+                f"epilepsy — please confirm with a qualified neurologist."
+            )
+        else:
+            return (
+                f"🔴 **Your EEG shows: {stype} Seizure**\n\n"
+                f"{desc}\n\n"
+                f"**ICD-10:** {icd10} | **Confidence:** {conf*100:.0f}%\n\n"
+                f"⚠️ This AI result is for research/screening purposes. "
+                f"Please consult a **neurologist** for clinical evaluation and diagnosis."
+            )
+
+    # ────────────────────────────────────────────────────────────────
+    # INTENT 3: confidence / accuracy questions
+    # ────────────────────────────────────────────────────────────────
+    if _has("confiden", "accurat", "reliable", "trust", "how sure", "certain", "probability"):
+        base = (
+            "**Confidence** is the probability the ensemble of AI models assigns to the predicted class.\n\n"
+            "- **>85%** — high confidence, very likely correct\n"
+            "- **70–85%** — moderate confidence, result is probable\n"
+            "- **<70%** — lower confidence, result should be interpreted cautiously\n\n"
+            "The system uses a soft-vote **ensemble** of up to 5 models "
+            "(RandomForest, LogisticRegression, SVM, KNN, CNN-1D).\n\n"
+        )
+        if has_result:
+            level = "high" if conf > 0.85 else ("moderate" if conf > 0.70 else "lower")
+            base += f"📋 **Your result confidence: {conf*100:.0f}% ({level})**"
+        return base
+
+    # ────────────────────────────────────────────────────────────────
+    # INTENT 4: seizure type — absence
+    # ────────────────────────────────────────────────────────────────
+    if _has("absence", "petit mal", "3 hz", "spike wave", "swd"):
+        return (
+            "## Absence Seizure (ICD-10: G40.3)\n\n"
+            "Absence seizures are brief (~5–30 sec) generalised non-convulsive episodes "
+            "characterised by:\n"
+            "- **3 Hz symmetric spike-and-wave discharges (SWD)** on EEG\n"
+            "- Abrupt onset and offset — the person suddenly stops and stares\n"
+            "- Very high **delta band power**, very **low entropy** (highly periodic signal)\n"
+            "- High **bilateral cross-correlation** (both hemispheres in sync)\n"
+            "- **No convulsions** — the person does not fall\n\n"
+            "**Typical patients:** Children aged 4–14; often outgrown by adulthood.\n\n"
+            "**Treatment:** Ethosuximide (first-line), valproate, or lamotrigine."
+            + _result_ctx()
+        )
+
+    # ────────────────────────────────────────────────────────────────
+    # INTENT 5: focal seizure
+    # ────────────────────────────────────────────────────────────────
+    if _has("focal", "partial", "localised", "localized", "temporal lobe"):
+        return (
+            "## Focal (Partial) Seizure (ICD-10: G40.1)\n\n"
+            "Focal seizures originate in **one localised brain region**:\n"
+            "- **Rhythmic theta discharge (4–8 Hz)** confined to one hemisphere/lobe\n"
+            "- **Very low cross-channel correlation** (other channels unaffected)\n"
+            "- Elevated **interictal spike rate** in the ictal zone\n"
+            "- **Reduced spectral entropy** (more ordered than normal EEG)\n\n"
+            "**Symptoms vary** by location: motor (jerking), sensory (tingling), "
+            "autonomic (nausea), or cognitive (déjà vu).\n\n"
+            "**May generalise** into a tonic-clonic seizure.\n\n"
+            "**Treatment:** Carbamazepine, oxcarbazepine, levetiracetam. "
+            "Surgical resection if drug-resistant."
+            + _result_ctx()
+        )
+
+    # ────────────────────────────────────────────────────────────────
+    # INTENT 6: tonic / atonic / tonic-atonic
+    # ────────────────────────────────────────────────────────────────
+    if _has("tonic", "atonic", "drop attack", "grand mal", "convuls"):
+        return (
+            "## Tonic / Atonic Seizure (ICD-10: G40.5 / G40.8)\n\n"
+            "**Tonic phase:** Sudden sustained muscle stiffening:\n"
+            "- **Highest zero-crossing rate** of all seizure types (rapid oscillation)\n"
+            "- **Maximal signal amplitude and wavelet energy**\n"
+            "- **High Hjorth complexity** and elevated gamma power\n"
+            "- **Bilateral spread** → high cross-channel correlation\n\n"
+            "**Atonic phase:** Sudden loss of muscle tone → fall ('drop attack').\n\n"
+            "**Danger:** High injury risk from falls.\n\n"
+            "**Treatment:** Valproate, lamotrigine, rufinamide. "
+            "VNS or corpus callosotomy for refractory cases."
+            + _result_ctx()
+        )
+
+    # ────────────────────────────────────────────────────────────────
+    # INTENT 7: normal EEG
+    # ────────────────────────────────────────────────────────────────
+    if ((_has("normal") and _has("eeg", "result", "brain", "signal", "mean")) or
+            q in ("what is normal eeg", "normal eeg")):
+        return (
+            "## Normal EEG\n\n"
+            "A normal awake EEG shows:\n"
+            "- **Alpha rhythm dominant (8–13 Hz)** — especially in posterior regions\n"
+            "- **High spectral entropy** — complex, irregular activity (healthy)\n"
+            "- **Low delta and theta power** — slow waves are abnormal when awake\n"
+            "- **Low cross-channel correlation** — channels oscillate independently\n"
+            "- **Low interictal spike rate** — fewer than 1 spike/second\n\n"
+            "A normal result does **not** rule out epilepsy — seizures may not appear "
+            "in a short recording."
+            + _result_ctx()
+        )
+
+    # ────────────────────────────────────────────────────────────────
+    # INTENT 8: band power questions
+    # ────────────────────────────────────────────────────────────────
+    if _has("delta", "theta", "alpha", "beta", "gamma") and _has("band", "power", "wave", "frequency", "hz"):
+        band_info = {
+            "delta": ("0.5–4 Hz", "Deep sleep; dominant in absence and tonic-atonic seizures; abnormal in waking EEG."),
+            "theta": ("4–8 Hz", "Drowsiness/focal seizure ictal zone; elevated theta suggests focal onset."),
+            "alpha": ("8–13 Hz", "Relaxed wakefulness; dominant alpha = normal brain state."),
+            "beta":  ("13–30 Hz", "Active thinking; elevated in tonic phase or medication effect."),
+            "gamma": ("30–45 Hz", "High cognitive load or tonic burst; elevated in tonic seizures."),
+        }
+        answers = []
+        for bname, (brange, bdesc) in band_info.items():
+            if bname in q:
+                answers.append(f"**{bname.capitalize()} ({brange}):** {bdesc}")
+        if answers:
+            result_ctx = ""
+            if has_result and bp:
+                result_ctx = "\n\n📋 **Your band powers:**\n"
+                for b, (lo, hi) in EEG_BANDS.items():
+                    rel = bp.get(b, {}).get("rel", 0) * 100
+                    result_ctx += f"- {b.capitalize()}: {rel:.1f}%\n"
+            return "\n\n".join(answers) + result_ctx
+        # Generic band power question
+        if has_result and bp:
+            lines = ["**Your EEG band power breakdown:**"]
+            for b in ("delta","theta","alpha","beta","gamma"):
+                rel = bp.get(b, {}).get("rel", 0) * 100
+                lines.append(f"- {b.capitalize()}: {rel:.1f}%")
+            return "\n".join(lines)
+        return ("EEG is divided into frequency bands:\n"
+                "- **Delta (0.5–4 Hz):** deep sleep / seizure\n"
+                "- **Theta (4–8 Hz):** drowsy / focal seizure\n"
+                "- **Alpha (8–13 Hz):** relaxed wakefulness (normal)\n"
+                "- **Beta (13–30 Hz):** active cognition\n"
+                "- **Gamma (30–45 Hz):** high-level processing / tonic bursts")
+
+    # ────────────────────────────────────────────────────────────────
+    # INTENT 9: spike / interictal spikes
+    # ────────────────────────────────────────────────────────────────
+    if _has("spike", "interictal", "discharge", "epileptiform"):
+        base = (
+            "**Interictal spikes** are sharp EEG transients (lasting <200 ms) "
+            "that occur *between* seizures. They are a hallmark of epilepsy.\n\n"
+            "- **Normal:** <0.1 spikes/second\n"
+            "- **Borderline:** 1–5 spikes/second\n"
+            "- **Epileptiform:** >5 spikes/second\n\n"
+            "Focal spikes appear in one region; generalised spike-wave "
+            "(3 Hz) is the hallmark of absence epilepsy."
+        )
+        if has_result and si:
+            sr = si.get("spike_rate_per_s", 0)
+            n  = si.get("n_spikes", 0)
+            base += f"\n\n📋 **Your EEG:** {n} spikes detected ({sr:.2f}/s)"
+        return base
+
+    # ────────────────────────────────────────────────────────────────
+    # INTENT 10: entropy questions
+    # ────────────────────────────────────────────────────────────────
+    if _has("entropy", "sample entropy", "spectral entropy", "permutation"):
+        return (
+            "**Entropy** measures the complexity/randomness of the EEG signal:\n\n"
+            "- **High entropy** → complex, irregular → **Normal** brain activity\n"
+            "- **Low entropy** → periodic, ordered → **Seizure** (especially absence)\n\n"
+            "Types used in NeuroScan Pro:\n"
+            "- **Sample entropy** — regularity of short patterns\n"
+            "- **Spectral entropy** — spread of frequency content\n"
+            "- **Permutation entropy** — ordinal patterns in time series\n\n"
+            "Absence seizures have the **lowest entropy** (most periodic). "
+            "Normal EEG has the **highest**." + _result_ctx()
+        )
+
+    # ────────────────────────────────────────────────────────────────
+    # INTENT 11: what to do next / next steps
+    # ────────────────────────────────────────────────────────────────
+    if _has("what to do", "next step", "what should", "what now", "recommend",
+            "treatment", "see doctor", "neurologist", "hospital"):
+        if not has_result:
+            return (
+                "Without a result yet, I recommend:\n"
+                "1. Upload your EEG file in **Upload & Analyse** tab\n"
+                "2. Train models (or load a saved model) in **Dashboard**\n"
+                "3. Run Full Epilepsy Analysis\n"
+                "4. Return here for guidance on your result"
+            )
+        if not is_epi:
+            return (
+                "✅ Your EEG shows **Normal** activity.\n\n"
+                "**Recommended next steps:**\n"
+                "1. Share this result with your **neurologist** for clinical confirmation\n"
+                "2. Note that a single normal EEG does **not** rule out epilepsy — "
+                "seizures may not occur during the recording\n"
+                "3. If you have symptoms, request a **prolonged EEG** or sleep EEG\n"
+                "4. Keep a **seizure diary** if you experience any episodes"
+            )
+        else:
+            specific = {
+                "Focal": (
+                    "1. Consult a **neurologist** urgently for clinical EEG and MRI\n"
+                    "2. First-line medications: **carbamazepine**, oxcarbazepine, levetiracetam\n"
+                    "3. Avoid driving until seizure-free for the legally required period\n"
+                    "4. Discuss surgical options if drug-resistant (focal resection)"
+                ),
+                "Absence": (
+                    "1. Consult a **paediatric neurologist** (most common in children)\n"
+                    "2. First-line: **ethosuximide** or valproate\n"
+                    "3. Usually benign — many children outgrow absence epilepsy\n"
+                    "4. Avoid triggers: hyperventilation, flickering lights"
+                ),
+                "Tonic-Atonic": (
+                    "1. Seek **urgent neurological evaluation**\n"
+                    "2. Safety measures: wear a **helmet**, use padded environments\n"
+                    "3. Medications: valproate, lamotrigine, rufinamide\n"
+                    "4. Discuss VNS or corpus callosotomy for refractory cases"
+                ),
+            }
+            steps = specific.get(stype,
+                "1. Consult a neurologist for full clinical EEG\n"
+                "2. Start appropriate anti-seizure medication\n"
+                "3. Avoid seizure triggers and unsafe activities")
+            return (
+                f"⚠️ Your EEG shows **{stype} Seizure** activity.\n\n"
+                f"**Recommended next steps:**\n{steps}\n\n"
+                f"⚠️ This is AI screening — always confirm with a "
+                f"qualified neurologist before any medical decisions."
+            )
+
+    # ────────────────────────────────────────────────────────────────
+    # INTENT 12: medication questions
+    # ────────────────────────────────────────────────────────────────
+    if _has("medication", "medicine", "drug", "tablet", "pill", "treat",
+            "valproate", "carbamazepine", "lamotrigine", "levetiracetam",
+            "ethosuximide", "phenytoin"):
+        meds = {
+            "valproate":     "Broad-spectrum; first-line for absence, tonic-atonic, generalised epilepsy.",
+            "carbamazepine": "First-line for focal seizures; not effective for absence.",
+            "lamotrigine":   "Used for focal and generalised seizures; safe in pregnancy.",
+            "levetiracetam": "Broad-spectrum add-on; well-tolerated, minimal drug interactions.",
+            "ethosuximide":  "First-line specifically for absence seizures only.",
+            "phenytoin":     "Older agent for focal/tonic-clonic; narrow therapeutic window.",
+        }
+        specific = [f"**{k.capitalize()}:** {v}" for k, v in meds.items() if k in q]
+        if specific:
+            return "\n\n".join(specific) + "\n\n⚠️ Never start or stop medication without a neurologist's guidance."
+        return (
+            "**Common anti-seizure medications:**\n\n"
+            "| Medication | Best for |\n"
+            "|---|---|\n"
+            "| Ethosuximide | Absence only |\n"
+            "| Carbamazepine | Focal seizures |\n"
+            "| Valproate | Generalised / absence / tonic-atonic |\n"
+            "| Lamotrigine | Focal + generalised |\n"
+            "| Levetiracetam | Add-on for focal + generalised |\n\n"
+            "⚠️ Medication must be prescribed and monitored by a neurologist."
+        )
+
+    # ────────────────────────────────────────────────────────────────
+    # INTENT 13: what is epilepsy / what is EEG
+    # ────────────────────────────────────────────────────────────────
+    if _has("what is epilepsy", "epilepsy is", "define epilepsy") or (
+            _has("epilepsy") and _has("what", "define", "explain", "tell me about")):
+        return (
+            "**Epilepsy** is a neurological disorder defined by recurrent unprovoked seizures.\n\n"
+            "- Affects ~50 million people worldwide\n"
+            "- Caused by abnormal, excessive electrical discharges in the brain\n"
+            "- Diagnosed after 2 or more unprovoked seizures, or one seizure with high recurrence risk\n"
+            "- Classified by seizure type: focal (partial) or generalised\n\n"
+            "**EEG (Electroencephalography)** records the brain's electrical activity via scalp electrodes. "
+            "It is the **gold standard** tool for diagnosing and classifying epilepsy."
+        )
+
+    if (_has("what is eeg", "eeg is", "eeg mean", "eeg work") or
+            (q in ("eeg", "electroencephalography", "what is eeg"))):
+        return (
+            "**EEG (Electroencephalography)** measures electrical activity of the brain "
+            "using electrodes placed on the scalp.\n\n"
+            "- Each electrode records voltage fluctuations produced by neuron firing\n"
+            "- The standard clinical montage uses **19 electrodes** (10–20 system)\n"
+            "- Sample rate is typically **256–512 Hz**\n"
+            "- Key patterns: alpha rhythm (normal), spike-wave (epilepsy), slow waves (pathology)\n\n"
+            "NeuroScan Pro analyses EEG signals to detect and classify epileptic activity."
+        )
+
+    # ────────────────────────────────────────────────────────────────
+    # INTENT 14: dominant frequency
+    # ────────────────────────────────────────────────────────────────
+    if _has("dominant frequency", "dominant freq", "peak frequency", "main frequency"):
+        base = (
+            "**Dominant frequency** is the frequency at which the EEG has its highest power.\n\n"
+            "- **<4 Hz (delta):** pathological when awake — absence or tonic-atonic seizure\n"
+            "- **4–8 Hz (theta):** focal seizure or drowsiness\n"
+            "- **8–13 Hz (alpha):** normal relaxed wakefulness\n"
+            "- **>13 Hz (beta/gamma):** active cognition or tonic fast activity\n"
+        )
+        if has_result and domf and domf > 0:
+            base += f"\n\n📋 **Your dominant frequency: {domf:.1f} Hz**"
+        return base
+
+    # ────────────────────────────────────────────────────────────────
+    # INTENT 15: hjorth parameters
+    # ────────────────────────────────────────────────────────────────
+    if _has("hjorth", "mobility", "complexity", "activity"):
+        return (
+            "**Hjorth parameters** characterise EEG signal morphology:\n\n"
+            "- **Activity:** signal variance — how energetic the signal is\n"
+            "- **Mobility:** ratio of first-derivative variance to signal variance "
+            "— measures mean frequency\n"
+            "- **Complexity:** how closely the signal resembles a pure sine wave; "
+            "higher = more complex waveform\n\n"
+            "In seizures:\n"
+            "- Tonic-atonic: **highest complexity** (irregular rapid bursts)\n"
+            "- Absence: **elevated complexity** (irregular spike-wave morphology)\n"
+            "- Normal: **low complexity** (smooth alpha rhythm)"
+        )
+
+    # ────────────────────────────────────────────────────────────────
+    # INTENT 16: models used / how does AI work
+    # ────────────────────────────────────────────────────────────────
+    if (_has("model", "algorithm", "ai", "machine learning", "how does it work",
+             "random forest", "svm", "cnn", "knn", "logistic")):
+        return (
+            "**NeuroScan Pro uses an ensemble of 5 AI models:**\n\n"
+            "**Classical models:**\n"
+            "- **Random Forest** — ensemble of decision trees, primary classifier\n"
+            "- **Logistic Regression** — linear probabilistic classifier\n"
+            "- **SVM** (Support Vector Machine) — RBF kernel classifier\n"
+            "- **KNN** (K-Nearest Neighbours) — distance-based classifier\n\n"
+            "**Deep learning (pure NumPy — no GPU needed):**\n"
+            "- **CNN-1D** — 2-layer neural network with ReLU + dropout regularisation\n\n"
+            "Training: **70% train / 15% validation / 15% test** + **5-fold cross-validation**.\n"
+            "Final prediction: **soft-vote ensemble** of all models with val F1 > 0.40."
+        )
+
+    # ────────────────────────────────────────────────────────────────
+    # INTENT 17: ICD-10 / classification code
+    # ────────────────────────────────────────────────────────────────
+    if _has("icd", "icd10", "icd-10", "code", "classification code"):
+        return (
+            "**ICD-10 codes for epilepsy:**\n\n"
+            "| Type | ICD-10 |\n"
+            "|---|---|\n"
+            "| Normal (no epilepsy) | — |\n"
+            "| Focal (partial) seizure | G40.1 |\n"
+            "| Absence seizure | G40.3 |\n"
+            "| Tonic / Atonic seizure | G40.5 / G40.8 |\n"
+            + _result_ctx()
+        )
+
+    # ────────────────────────────────────────────────────────────────
+    # INTENT 18: split / training / validation data
+    # ────────────────────────────────────────────────────────────────
+    if _has("train", "split", "validation", "test set", "cross valid", "kfold", "k fold"):
+        return (
+            "**NeuroScan Pro training protocol:**\n\n"
+            "- **70% training** — used to fit all models\n"
+            "- **15% validation** — used to select the best model and hyperparameters\n"
+            "- **15% test** — held-out, never seen during training; final performance benchmark\n\n"
+            "Additionally, **5-fold stratified cross-validation** is run on the training "
+            "set for tree-based models to ensure robust estimates of generalisation.\n\n"
+            "This prevents **data leakage** and ensures the reported metrics are honest."
+        )
+
+    # ────────────────────────────────────────────────────────────────
+    # INTENT 19: what causes epilepsy / triggers
+    # ────────────────────────────────────────────────────────────────
+    if _has("cause", "trigger", "why", "risk factor") and _has("epilepsy", "seizure"):
+        return (
+            "**Causes of epilepsy:**\n"
+            "- Genetic/hereditary factors (idiopathic epilepsy)\n"
+            "- Structural: brain tumour, stroke, traumatic brain injury\n"
+            "- Metabolic: hypoglycaemia, hyponatraemia, drug/alcohol withdrawal\n"
+            "- Infectious: meningitis, encephalitis\n"
+            "- Unknown (cryptogenic) — most common\n\n"
+            "**Common seizure triggers:**\n"
+            "- Sleep deprivation\n"
+            "- Missed medication\n"
+            "- Stress or anxiety\n"
+            "- Flickering lights (photosensitive epilepsy)\n"
+            "- Alcohol or recreational drugs\n"
+            "- Fever (in children — febrile seizures)"
+        )
+
+    # ────────────────────────────────────────────────────────────────
+    # FALLBACK — unclear question
+    # ────────────────────────────────────────────────────────────────
+    return (
+        "🤔 I'm not sure I understood that. Here are some things you can ask me:\n\n"
+        "- *\"What does my result mean?\"*\n"
+        "- *\"What is an absence seizure?\"*\n"
+        "- *\"What are the next steps after my diagnosis?\"*\n"
+        "- *\"What medications are used for focal seizures?\"*\n"
+        "- *\"Explain the band power in my EEG\"*\n"
+        "- *\"How does the AI model work?\"*\n"
+        "- *\"What is the ICD-10 code for my result?\"*\n\n"
+        "Try rephrasing your question!"
+    )
+
+
+def _tab_chatbot():
+    st.markdown('<h3 style="color:#00bcd4;">💬 NeuroBot — EEG Assistant</h3>',
+                unsafe_allow_html=True)
+
+    prediction = st.session_state.prediction
+
+    # Context banner
+    if prediction:
+        stype  = prediction.get("seizure_type", "Unknown")
+        conf   = prediction.get("confidence", 0) * 100
+        colour = _SCOLOURS.get(stype, "#00bcd4")
+        st.markdown(
+            f'<div style="border:1px solid {colour};border-radius:10px;padding:10px 16px;'
+            f'background:rgba(0,0,0,.3);margin-bottom:16px;">'
+            f'<b style="color:{colour}">🔬 Current result context:</b> '
+            f'<span style="color:#e0e0e0">{stype}</span> '
+            f'<span style="color:#90a4ae">({conf:.0f}% confidence)</span>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+    else:
+        st.info("💡 No result loaded yet. Upload an EEG file and run analysis for personalised answers. "
+                "You can still ask general epilepsy and EEG questions.")
+
+    # Chat history display
+    history = st.session_state.chat_history
+    for msg in history:
+        role  = msg["role"]
+        text  = msg["text"]
+        if role == "user":
+            st.markdown(
+                f'<div style="background:rgba(21,101,192,.25);border-radius:10px 10px 2px 10px;'
+                f'padding:10px 14px;margin:6px 0 6px 60px;text-align:right;color:#e0e0e0;">'
+                f'👤 {text}</div>',
+                unsafe_allow_html=True
+            )
+        else:
+            st.markdown(
+                f'<div style="background:rgba(0,188,212,.10);border:1px solid rgba(0,188,212,.2);'
+                f'border-radius:2px 10px 10px 10px;padding:12px 16px;margin:6px 60px 6px 0;'
+                f'color:#e0e0e0;">'
+                f'🤖 <b style="color:#00bcd4">NeuroBot:</b><br>{text}</div>',
+                unsafe_allow_html=True
+            )
+
+    st.markdown("---")
+
+    # Quick-question chips
+    st.markdown("**💡 Quick questions:**")
+    qcols = st.columns(3)
+    quick_qs = [
+        "What does my result mean?",
+        "What are the next steps?",
+        "What is an absence seizure?",
+        "How does the AI model work?",
+        "Explain the band power",
+        "What medications are used?",
+    ]
+    for i, qq in enumerate(quick_qs):
+        with qcols[i % 3]:
+            if st.button(qq, key=f"qq_{i}", use_container_width=True):
+                answer = _neurobot_answer(qq, prediction)
+                st.session_state.chat_history.append({"role": "user",  "text": qq})
+                st.session_state.chat_history.append({"role": "bot",   "text": answer})
+                st.rerun()
+
+    st.markdown("")
+
+    # Text input
+    col_inp, col_btn = st.columns([5, 1])
+    with col_inp:
+        user_input = st.text_input(
+            "Ask NeuroBot:",
+            placeholder="e.g. What does focal seizure mean? What should I do next?",
+            label_visibility="collapsed",
+            key="chatbot_input",
+        )
+    with col_btn:
+        send = st.button("Send ➤", key="btn_chat_send", use_container_width=True, type="primary")
+
+    if send and user_input.strip():
+        answer = _neurobot_answer(user_input.strip(), prediction)
+        st.session_state.chat_history.append({"role": "user", "text": user_input.strip()})
+        st.session_state.chat_history.append({"role": "bot",  "text": answer})
+        st.rerun()
+
+    if history:
+        if st.button("🗑️ Clear chat", key="btn_clear_chat", use_container_width=False):
+            st.session_state.chat_history = []
+            st.rerun()
+
+
+
     st.markdown('<h3 style="color:#00bcd4;">⚙️ Settings</h3>',
                 unsafe_allow_html=True)
     col1, col2 = st.columns(2)
@@ -1414,10 +2216,6 @@ def _tab_settings():
         st.metric("Python", f"{sys.version_info.major}.{sys.version_info.minor}")
         st.metric("NumPy", np.__version__)
         try: import sklearn; st.metric("scikit-learn", sklearn.__version__)
-        except: pass
-        try: import xgboost as xgb; st.metric("XGBoost", xgb.__version__)
-        except: pass
-        try: import lightgbm as lgb; st.metric("LightGBM", lgb.__version__)
         except: pass
         try: import antropy; st.metric("antropy", antropy.__version__)
         except: st.metric("antropy", "not installed (optional)")
@@ -1432,7 +2230,37 @@ def _tab_settings():
                   if st.session_state.feature_names else "0")
         st.metric("Saved model", "Exists" if os.path.exists(MODEL_SAVE_PATH) else "None")
 
-    if st.button("🗑️ Reset session"):
+    if st.button("🗑️ Reset session", key="btn_reset_chatbot"):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.rerun()
+
+
+# ── Tab: Settings ─────────────────────────────────────────────
+def _tab_settings():
+    st.markdown('<h3 style="color:#00bcd4;">⚙️ Settings</h3>',
+                unsafe_allow_html=True)
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("System info")
+        st.metric("Python", f"{sys.version_info.major}.{sys.version_info.minor}")
+        st.metric("NumPy", np.__version__)
+        try: import sklearn; st.metric("scikit-learn", sklearn.__version__)
+        except: pass
+        try: import antropy; st.metric("antropy", antropy.__version__)
+        except: st.metric("antropy", "not installed (optional)")
+    with col2:
+        st.subheader("Session")
+        st.metric("Models trained", "Yes" if st.session_state.models_trained else "No")
+        st.metric("Training samples",
+                  f"{st.session_state.n_train_samples:,}"
+                  if st.session_state.n_train_samples else "0")
+        st.metric("Feature count",
+                  str(len(st.session_state.feature_names))
+                  if st.session_state.feature_names else "0")
+        st.metric("Saved model", "Exists" if os.path.exists(MODEL_SAVE_PATH) else "None")
+
+    if st.button("🗑️ Reset session", key="btn_reset_settings"):
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.rerun()
@@ -1460,6 +2288,7 @@ def main():
         "🔍 Result",
         "🧠 Brain Viz",
         "🤖 Models",
+        "💬 Ask NeuroBot",
         "⚙️ Settings",
     ])
     with tabs[0]: _tab_dashboard()
@@ -1467,7 +2296,8 @@ def main():
     with tabs[2]: _tab_predict()
     with tabs[3]: _tab_brain()
     with tabs[4]: _tab_models()
-    with tabs[5]: _tab_settings()
+    with tabs[5]: _tab_chatbot()
+    with tabs[6]: _tab_settings()
 
 
 if __name__ == "__main__":
