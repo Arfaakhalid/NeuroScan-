@@ -684,10 +684,10 @@ def _align_features(feat_vec: np.ndarray,
 # ================================================================
 
 def prepare_split(X: np.ndarray, y: np.ndarray,
-                  test_size: float = 0.2,
-                  val_size:  float = 0.1,
+                  test_size: float = 0.15,
+                  val_size:  float = 0.15,
                   scale: bool = True) -> dict:
-    """Stratified split + StandardScaler."""
+    """Stratified 70/15/15 split + StandardScaler."""
     X_tv, X_test, y_tv, y_test = train_test_split(
         X, y, test_size=test_size, random_state=42, stratify=y)
     val_ratio = val_size / (1.0 - test_size)
