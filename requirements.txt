@@ -1,4 +1,4 @@
-# NeuroScan Pro — lightweight requirements (no GPU needed)
+# NeuroScan Pro
 streamlit>=1.28.0
 numpy>=1.24.0
 pandas>=2.0.0
@@ -6,8 +6,6 @@ plotly>=5.17.0
 scipy>=1.11.0
 scikit-learn>=1.3.0
 joblib>=1.3.0
-xgboost>=2.0.0
-lightgbm>=4.0.0
 mne>=1.4.0
 pyedflib>=0.1.28
 PyWavelets>=1.4.0
