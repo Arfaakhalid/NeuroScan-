@@ -4,7 +4,7 @@ chatbot.py  —  NeuroScan Pro
 NeuroBot: Smart clinical EEG assistant.
 
 LLM BACKEND (INTERNET REQUIRED):
-  Uses Groq's free tier  →  llama-3.3-70b-versatile
+  Use Groq's free tier  →  llama-3.3-70b-versatile
   Get a free key at: https://console.groq.com  (no credit card needed)
   Enter it in the chatbot sidebar OR set env var GROQ_API_KEY.
 
